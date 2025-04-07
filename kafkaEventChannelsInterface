@@ -1,0 +1,18 @@
+package com.disasterrelief.intake;
+
+import org.springframework.cloud.stream.annotation.Input;
+import org.springframework.cloud.stream.annotation.Output;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.SubscribableChannel;
+
+public interface ClaimEventChannels {
+    
+    String CLAIM_SUBMITTED_OUTPUT = "claimSubmittedOutput";
+    String CLAIM_STATUS_UPDATED_INPUT = "claimStatusUpdatedInput";
+    
+    @Output(CLAIM_SUBMITTED_OUTPUT)
+    MessageChannel claimSubmittedOutput();
+    
+    @Input(CLAIM_STATUS_UPDATED_INPUT)
+    SubscribableChannel claimStatusUpdatedInput();
+}
