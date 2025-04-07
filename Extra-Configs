@@ -1,0 +1,30 @@
+##Apigee
+###API Gateway Configuration
+<!-- apiproxy/disaster-relief-api.xml -->
+<APIProxy revision="1" name="disaster-relief-api">
+    <Description>Disaster Relief Claims Processing API</Description>
+    <DisplayName>Disaster Relief Claims API</DisplayName>
+    <Policies>
+        <!-- Security Policies -->
+        <Policy>OAuth2-Validation</Policy>
+        <Policy>Quota-Enforcement</Policy>
+        <Policy>Spike-Arrest</Policy>
+        <Policy>JSON-Threat-Protection</Policy>
+        <Policy>API-Key-Verification</Policy>
+        
+        <!-- Operational Policies -->
+        <Policy>Response-Cache</Policy>
+        <Policy>CORS-Handling</Policy>
+        <Policy>Error-Handling</Policy>
+        <Policy>Analytics-Capture</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>claim-intake</TargetEndpoint>
+        <TargetEndpoint>claim-assessment</TargetEndpoint>
+        <TargetEndpoint>eligibility</TargetEndpoint>
+        <TargetEndpoint>disbursement</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>
