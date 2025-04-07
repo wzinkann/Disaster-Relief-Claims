@@ -76,8 +76,7 @@ This architecture provides high availability, scalability, and resilience, essen
 
 ## Kubernetes
 ### Kubernetes Deployment Configuration
-
-'#' claim-intake-service-deployment.yaml
+claim-intake-service-deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
