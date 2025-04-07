@@ -1,0 +1,328 @@
+package com.disasterrelief.eligibility.service;
+
+import com.disasterrelief.eligibility.client.AssessmentClient;
+import com.disasterrelief.eligibility.client.ClaimIntakeClient;
+import com.disasterrelief.eligibility.dto.AssessmentResultDto;
+import com.disasterrelief.eligibility.dto.ClaimDetailsDto;
+import com.disasterrelief.eligibility.dto.EligibilityRequestDto;
+import com.disasterrelief.eligibility.dto.EligibilityResultDto;
+import com.disasterrelief.eligibility.events.EligibilityDeterminedEvent;
+import com.disasterrelief.eligibility.events.EligibilityEventChannels;
+import com.disasterrelief.eligibility.model.EligibilityCheck;
+import com.disasterrelief.eligibility.model.EligibilityResult;
+import com.disasterrelief.eligibility.repository.EligibilityResultRepository;
+import com.disasterrelief.eligibility.rules.ClaimFacts;
+import com.disasterrelief.eligibility.rules.EligibilityRulesService;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@Slf4j
+public class EligibilityServiceImpl implements EligibilityService {
+
+    private final EligibilityResultRepository eligibilityRepository;
+    private final ClaimIntakeClient claimIntakeClient;
+    private final AssessmentClient assessmentClient;
+    private final EligibilityRulesService rulesService;
+    private final EligibilityEventChannels eventChannels;
+    private final PropertyVerificationService propertyVerificationService;
+    private final IdentityVerificationService identityVerificationService;
+
+    @Autowired
+    public EligibilityServiceImpl(
+            EligibilityResultRepository eligibilityRepository,
+            ClaimIntakeClient claimIntakeClient,
+            AssessmentClient assessmentClient,
+            EligibilityRulesService rulesService,
+            EligibilityEventChannels eventChannels,
+            PropertyVerificationService propertyVerificationService,
+            IdentityVerificationService identityVerificationService) {
+        this.eligibilityRepository = eligibilityRepository;
+        this.claimIntakeClient = claimIntakeClient;
+        this.assessmentClient = assessmentClient;
+        this.rulesService = rulesService;
+        this.eventChannels = eventChannels;
+        this.propertyVerificationService = propertyVerificationService;
+        this.identityVerificationService = identityVerificationService;
+    }
+
+    @Override
+    @Transactional
+    public EligibilityResultDto determineEligibility(EligibilityRequestDto requestDto) {
+        log.info("Starting eligibility determination for claim: {}", requestDto.getClaimId());
+        
+        // Fetch necessary data
+        ClaimDetailsDto claimDetails = claimIntakeClient.getClaimDetails(requestDto.getClaimId());
+        AssessmentResultDto assessmentResult = assessmentClient.getAssessmentResult(requestDto.getAssessmentId());
+        
+        // Create eligibility record
+        EligibilityResult eligibility = new EligibilityResult();
+        eligibility.setId(UUID.randomUUID().toString());
+        eligibility.setClaimId(requestDto.getClaimId());
+        eligibility.setAssessmentId(requestDto.getAssessmentId());
+        eligibility.setStartedAt(LocalDateTime.now());
+        eligibility.setChecks(new ArrayList<>());
+        
+        // Save initial record
+        eligibilityRepository.save(eligibility);
+        
+        try {
+            // Perform verification checks
+            performVerificationChecks(eligibility, claimDetails, assessmentResult);
+            
+            // Apply business rules using Drools
+            applyBusinessRules(eligibility, claimDetails, assessmentResult);
+            
+            // Make final determination
+            makeFinalDetermination(eligibility);
+            
+            // Update completion time
+            eligibility.setCompletedAt(LocalDateTime.now());
+            EligibilityResult savedResult = eligibilityRepository.save(eligibility);
+            
+            // Publish event
+            publishEligibilityDetermined(savedResult, claimDetails, assessmentResult);
+            
+            return mapToResultDto(savedResult);
+            
+        } catch (Exception e) {
+            log.error("Error during eligibility determination: {}", e.getMessage());
+            eligibility.setStatus(EligibilityResult.Status.ERROR);
+            eligibility.setReason("System error: " + e.getMessage());
+            eligibility.setCompletedAt(LocalDateTime.now());
+            eligibilityRepository.save(eligibility);
+            
+            EligibilityResultDto resultDto = new EligibilityResultDto();
+            resultDto.setEligibilityId(eligibility.getId());
+            resultDto.setClaimId(eligibility.getClaimId());
+            resultDto.setStatus(EligibilityResult.Status.ERROR);
+            resultDto.setMessage("An error occurred during eligibility determination.");
+            return resultDto;
+        }
+    }
+    
+    private void performVerificationChecks(
+            EligibilityResult eligibility, 
+            ClaimDetailsDto claimDetails,
+            AssessmentResultDto assessmentResult) {
+        
+        log.info("Running verification checks for claim: {}", eligibility.getClaimId());
+        List<EligibilityCheck> checks = eligibility.getChecks();
+        
+        // Check 1: Identity verification
+        EligibilityCheck identityCheck = new EligibilityCheck();
+        identityCheck.setCheckType(EligibilityCheck.CheckType.IDENTITY_VERIFICATION);
+        try {
+            boolean identityVerified = identityVerificationService.verifyIdentity(
+                    claimDetails.getClaimantName(), 
+                    claimDetails.getClaimantEmail(),
+                    claimDetails.getClaimantPhone());
+            
+            identityCheck.setPassed(identityVerified);
+            identityCheck.setNotes(identityVerified ? 
+                    "Identity successfully verified" : "Could not verify identity");
+        } catch (Exception e) {
+            identityCheck.setPassed(false);
+            identityCheck.setNotes("Identity verification error: " + e.getMessage());
+            log.error("Identity check failed for claim {}: {}", eligibility.getClaimId(), e.getMessage());
+        }
+        checks.add(identityCheck);
+        
+        // Check 2: Property ownership verification
+        EligibilityCheck propertyCheck = new EligibilityCheck();
+        propertyCheck.setCheckType(EligibilityCheck.CheckType.PROPERTY_VERIFICATION);
+        try {
+            boolean propertyVerified = propertyVerificationService.verifyPropertyOwnership(
+                    claimDetails.getClaimantName(),
+                    claimDetails.getPropertyAddress());
+            
+            propertyCheck.setPassed(propertyVerified);
+            propertyCheck.setNotes(propertyVerified ? 
+                    "Property ownership verified" : "Could not verify property ownership");
+        } catch (Exception e) {
+            propertyCheck.setPassed(false);
+            propertyCheck.setNotes("Property verification error: " + e.getMessage());
+            log.error("Property check failed for claim {}: {}", eligibility.getClaimId(), e.getMessage());
+        }
+        checks.add(propertyCheck);
+        
+        // Check 3: Disaster zone verification
+        EligibilityCheck zoneCheck = new EligibilityCheck();
+        zoneCheck.setCheckType(EligibilityCheck.CheckType.DISASTER_ZONE_VERIFICATION);
+        boolean inZone = isInDisasterZone(
+                claimDetails.getDisasterId(), 
+                claimDetails.getLatitude(), 
+                claimDetails.getLongitude());
+        
+        zoneCheck.setPassed(inZone);
+        zoneCheck.setNotes(inZone ? 
+                "Property is in declared disaster zone" : "Property is not in declared disaster zone");
+checks.add(zoneCheck);
+        
+        // Check 4: Previous claims check
+        EligibilityCheck previousClaimsCheck = new EligibilityCheck();
+        previousClaimsCheck.setCheckType(EligibilityCheck.CheckType.PREVIOUS_CLAIMS);
+        boolean hasPreviousClaims = checkForPreviousClaims(
+                claimDetails.getClaimantEmail(),
+                claimDetails.getPropertyAddress(),
+                claimDetails.getDisasterId());
+                
+        previousClaimsCheck.setPassed(!hasPreviousClaims);
+        previousClaimsCheck.setNotes(!hasPreviousClaims ? 
+                "No duplicate claims found" : "Previous claim exists for this property/disaster");
+        checks.add(previousClaimsCheck);
+        
+        // Save intermediate results
+        eligibilityRepository.save(eligibility);
+    }
+    
+    private void applyBusinessRules(
+            EligibilityResult eligibility,
+            ClaimDetailsDto claimDetails,
+            AssessmentResultDto assessmentResult) {
+        
+        log.info("Applying business rules for claim: {}", eligibility.getClaimId());
+        
+        // Prepare facts for the rules engine
+        ClaimFacts facts = new ClaimFacts();
+        facts.setClaimId(claimDetails.getId());
+        facts.setDisasterId(claimDetails.getDisasterId());
+        facts.setDamageSeverity(assessmentResult.getDamageSeverity());
+        facts.setDamageType(assessmentResult.getDamageType());
+        facts.setEstimatedDamageAmount(assessmentResult.getEstimatedAmount());
+        facts.setPropertyAddress(claimDetails.getPropertyAddress());
+        facts.setPostalCode(claimDetails.getPostalCode());
+        facts.setLatitude(claimDetails.getLatitude());
+        facts.setLongitude(claimDetails.getLongitude());
+        
+        // Add verification results
+        for (EligibilityCheck check : eligibility.getChecks()) {
+            switch (check.getCheckType()) {
+                case IDENTITY_VERIFICATION:
+                    facts.setIdentityVerified(check.isPassed());
+                    break;
+                case PROPERTY_VERIFICATION:
+                    facts.setPropertyOwnershipVerified(check.isPassed());
+                    break;
+                case DISASTER_ZONE_VERIFICATION:
+                    facts.setInDisasterZone(check.isPassed());
+                    break;
+                case PREVIOUS_CLAIMS:
+                    facts.setHasPreviousClaims(!check.isPassed());
+                    break;
+            }
+        }
+        
+        // Execute rules engine
+        rulesService.executeRules(facts);
+        
+        // Add the rule results as checks
+        EligibilityCheck programRulesCheck = new EligibilityCheck();
+        programRulesCheck.setCheckType(EligibilityCheck.CheckType.PROGRAM_RULES);
+        programRulesCheck.setPassed(facts.isEligible());
+        programRulesCheck.setNotes(facts.getReasonDescription());
+        eligibility.getChecks().add(programRulesCheck);
+        
+        // Save rule execution results
+        eligibility.setAssistanceAmount(facts.getApprovedAmount());
+        eligibility.setReason(facts.getReasonDescription());
+    }
+    
+    private void makeFinalDetermination(EligibilityResult eligibility) {
+        log.info("Making final determination for claim: {}", eligibility.getClaimId());
+        
+        // Default to eligible
+        boolean isEligible = true;
+        String failureReason = "";
+        
+        // Check for any failed critical checks
+        for (EligibilityCheck check : eligibility.getChecks()) {
+            if (!check.isPassed() && isCriticalCheck(check.getCheckType())) {
+                isEligible = false;
+                failureReason = check.getNotes();
+                break;
+            }
+        }
+        
+        // Set final status
+        if (isEligible) {
+            eligibility.setStatus(EligibilityResult.Status.ELIGIBLE);
+        } else {
+            eligibility.setStatus(EligibilityResult.Status.INELIGIBLE);
+            eligibility.setReason(failureReason);
+            eligibility.setAssistanceAmount(0.0);
+        }
+    }
+    
+    private boolean isCriticalCheck(EligibilityCheck.CheckType checkType) {
+        return checkType == EligibilityCheck.CheckType.IDENTITY_VERIFICATION ||
+               checkType == EligibilityCheck.CheckType.PROPERTY_VERIFICATION ||
+               checkType == EligibilityCheck.CheckType.DISASTER_ZONE_VERIFICATION ||
+               checkType == EligibilityCheck.CheckType.PROGRAM_RULES;
+    }
+    
+    private boolean isInDisasterZone(String disasterId, double latitude, double longitude) {
+        // In a real implementation, this would query a geospatial database
+        // to check if the coordinates are within the declared disaster zone
+        
+        // For demonstration purposes, we'll assume a simple check
+        return true; // Simplified for this example
+    }
+    
+    private boolean checkForPreviousClaims(String claimantEmail, String propertyAddress, String disasterId) {
+        // In a real implementation, this would query a database of previous claims
+        
+        // For demonstration purposes, we'll assume no previous claims
+        return false; // Simplified for this example
+    }
+    
+    private void publishEligibilityDetermined(
+            EligibilityResult eligibility, 
+            ClaimDetailsDto claimDetails,
+            AssessmentResultDto assessmentResult) {
+        
+        EligibilityDeterminedEvent event = new EligibilityDeterminedEvent();
+        event.setEligibilityId(eligibility.getId());
+        event.setClaimId(eligibility.getClaimId());
+        event.setDeterminedAt(eligibility.getCompletedAt());
+        event.setEligible(eligibility.getStatus() == EligibilityResult.Status.ELIGIBLE);
+        event.setAssistanceAmount(eligibility.getAssistanceAmount());
+        event.setReason(eligibility.getReason());
+        event.setClaimantName(claimDetails.getClaimantName());
+        event.setClaimantEmail(claimDetails.getClaimantEmail());
+        event.setPropertyAddress(claimDetails.getPropertyAddress());
+        
+        eventChannels.eligibilityDeterminedOutput().send(MessageBuilder.withPayload(event).build());
+        log.info("Published eligibility determined event for claim {}: {}", 
+                eligibility.getClaimId(), 
+                eligibility.getStatus());
+    }
+    
+    private EligibilityResultDto mapToResultDto(EligibilityResult eligibility) {
+        EligibilityResultDto resultDto = new EligibilityResultDto();
+        resultDto.setEligibilityId(eligibility.getId());
+        resultDto.setClaimId(eligibility.getClaimId());
+        resultDto.setAssessmentId(eligibility.getAssessmentId());
+        resultDto.setStatus(eligibility.getStatus());
+        resultDto.setAssistanceAmount(eligibility.getAssistanceAmount());
+        resultDto.setMessage(eligibility.getReason());
+        
+        List<String> checkResults = new ArrayList<>();
+        for (EligibilityCheck check : eligibility.getChecks()) {
+            checkResults.add(check.getCheckType() + ": " + 
+                    (check.isPassed() ? "Passed" : "Failed") + " - " + check.getNotes());
+        }
+        resultDto.setCheckResults(checkResults);
+        
+        return resultDto;
+    }
+}
