@@ -1,0 +1,187 @@
+package com.disasterrelief.disbursement.service;
+
+import com.disasterrelief.disbursement.client.ClaimIntakeClient;
+import com.disasterrelief.disbursement.client.EligibilityClient;
+import com.disasterrelief.disbursement.dto.ClaimDetailsDto;
+import com.disasterrelief.disbursement.dto.DisbursementRequestDto;
+import com.disasterrelief.disbursement.dto.DisbursementResultDto;
+import com.disasterrelief.disbursement.dto.EligibilityResultDto;
+import com.disasterrelief.disbursement.events.DisbursementCompletedEvent;
+import com.disasterrelief.disbursement.events.DisbursementEventChannels;
+import com.disasterrelief.disbursement.model.Disbursement;
+import com.disasterrelief.disbursement.model.PaymentMethod;
+import com.disasterrelief.disbursement.repository.DisbursementRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Service
+@Slf4j
+public class DisbursementServiceImpl implements DisbursementService {
+
+    private final DisbursementRepository disbursementRepository;
+    private final ClaimIntakeClient claimIntakeClient;
+    private final EligibilityClient eligibilityClient;
+    private final DisbursementEventChannels eventChannels;
+    private final PaymentGatewayService paymentGatewayService;
+
+    @Autowired
+    public DisbursementServiceImpl(
+            DisbursementRepository disbursementRepository,
+            ClaimIntakeClient claimIntakeClient,
+            EligibilityClient eligibilityClient,
+            DisbursementEventChannels eventChannels,
+            PaymentGatewayService paymentGatewayService) {
+        this.disbursementRepository = disbursementRepository;
+        this.claimIntakeClient = claimIntakeClient;
+        this.eligibilityClient = eligibilityClient;
+        this.eventChannels = eventChannels;
+        this.paymentGatewayService = paymentGatewayService;
+    }
+
+    @Override
+    @Transactional
+    public DisbursementResultDto processDisbursement(DisbursementRequestDto requestDto) {
+        log.info("Processing disbursement for claim: {}", requestDto.getClaimId());
+        
+        // Fetch necessary data
+        ClaimDetailsDto claimDetails = claimIntakeClient.getClaimDetails(requestDto.getClaimId());
+        EligibilityResultDto eligibilityResult = eligibilityClient.getEligibilityResult(requestDto.getEligibilityId());
+        
+        // Validate eligibility
+        if (!isEligibleForDisbursement(eligibilityResult)) {
+            log.warn("Claim {} is not eligible for disbursement", requestDto.getClaimId());
+            return createRejectedResult(requestDto.getClaimId(), "Claim is not eligible for payment");
+        }
+        
+        // Create disbursement record
+        Disbursement disbursement = new Disbursement();
+        disbursement.setId(UUID.randomUUID().toString());
+        disbursement.setClaimId(requestDto.getClaimId());
+        disbursement.setEligibilityId(requestDto.getEligibilityId());
+        disbursement.setPaymentMethod(requestDto.getPaymentMethod());
+        disbursement.setPaymentDetails(requestDto.getPaymentDetails());
+        disbursement.setAmount(eligibilityResult.getAssistanceAmount());
+        disbursement.setStatus(Disbursement.Status.PENDING);
+        disbursement.setRecipientName(claimDetails.getClaimantName());
+        disbursement.setRecipientEmail(claimDetails.getClaimantEmail());
+        disbursement.setRequestedAt(LocalDateTime.now());
+        
+        // Save initial record
+        disbursementRepository.save(disbursement);
+        
+        try {
+            // Process the payment
+            String transactionId = processPayment(disbursement);
+            
+            // Update record with successful payment
+            disbursement.setStatus(Disbursement.Status.COMPLETED);
+            disbursement.setTransactionId(transactionId);
+            disbursement.setCompletedAt(LocalDateTime.now());
+            disbursement.setNotes("Payment processed successfully");
+            
+            Disbursement savedDisbursement = disbursementRepository.save(disbursement);
+            
+            // Publish disbursement completed event
+            publishDisbursementCompleted(savedDisbursement);
+            
+            return createSuccessResult(savedDisbursement);
+            
+        } catch (Exception e) {
+            log.error("Payment processing failed for claim {}: {}", disbursement.getClaimId(), e.getMessage());
+            
+            // Update record with failed payment
+            disbursement.setStatus(Disbursement.Status.FAILED);
+            disbursement.setNotes("Payment failed: " + e.getMessage());
+            disbursementRepository.save(disbursement);
+            
+            return createFailedResult(disbursement.getClaimId(), e.getMessage());
+        }
+    }
+    
+    private boolean isEligibleForDisbursement(EligibilityResultDto eligibilityResult) {
+        return eligibilityResult != null && 
+               eligibilityResult.getStatus() == EligibilityResult.Status.ELIGIBLE &&
+               eligibilityResult.getAssistanceAmount() > 0;
+    }
+    
+    private String processPayment(Disbursement disbursement) {
+        // In a real implementation, this would integrate with payment processors
+        // like ACH for direct deposits, check printing services, prepaid card issuers, etc.
+        
+        log.info("Processing {} payment of ${} for claim {}", 
+                disbursement.getPaymentMethod(), 
+                disbursement.getAmount(),
+                disbursement.getClaimId());
+        
+        switch (disbursement.getPaymentMethod()) {
+            case DIRECT_DEPOSIT:
+                return paymentGatewayService.processDirectDeposit(
+                        disbursement.getRecipientName(),
+                        disbursement.getPaymentDetails(),
+                        disbursement.getAmount());
+                
+            case CHECK:
+                return paymentGatewayService.issueCheck(
+                        disbursement.getRecipientName(),
+                        disbursement.getPaymentDetails(),
+                        disbursement.getAmount());
+                
+            case PREPAID_CARD:
+                return paymentGatewayService.issuePrepaidCard(
+                        disbursement.getRecipientName(),
+                        disbursement.getRecipientEmail(),
+                        disbursement.getAmount());
+                
+            default:
+                throw new IllegalArgumentException("Unsupported payment method: " + disbursement.getPaymentMethod());
+        }
+    }
+    
+    private void publishDisbursementCompleted(Disbursement disbursement) {
+        DisbursementCompletedEvent event = new DisbursementCompletedEvent();
+        event.setDisbursementId(disbursement.getId());
+        event.setClaimId(disbursement.getClaimId());
+        event.setAmount(disbursement.getAmount());
+        event.setTransactionId(disbursement.getTransactionId());
+        event.setPaymentMethod(disbursement.getPaymentMethod());
+        event.setCompletedAt(disbursement.getCompletedAt());
+        
+        eventChannels.disbursementCompletedOutput().send(MessageBuilder.withPayload(event).build());
+        log.info("Published disbursement completed event for claim {}", disbursement.getClaimId());
+    }
+    
+    private DisbursementResultDto createSuccessResult(Disbursement disbursement) {
+        DisbursementResultDto result = new DisbursementResultDto();
+        result.setDisbursementId(disbursement.getId());
+        result.setClaimId(disbursement.getClaimId());
+        result.setStatus(Disbursement.Status.COMPLETED);
+        result.setAmount(disbursement.getAmount());
+        result.setTransactionId(disbursement.getTransactionId());
+        result.setPaymentMethod(disbursement.getPaymentMethod());
+        result.setTimestamp(disbursement.getCompletedAt());
+        result.setMessage("Payment has been processed successfully");
+        return result;
+    }
+    
+    private DisbursementResultDto createFailedResult(String claimId, String errorMessage) {
+        DisbursementResultDto result = new DisbursementResultDto();
+        result.setClaimId(claimId);
+        result.setStatus(Disbursement.Status.FAILED);
+        result.setMessage("Payment processing failed: " + errorMessage);
+        return result;
+    }
+    
+    private DisbursementResultDto createRejectedResult(String claimId, String reason) {
+        DisbursementResultDto result = new DisbursementResultDto();
+        result.setClaimId(claimId);
+        result.setStatus(Disbursement.Status.REJECTED);
+        result.setMessage(reason);
+        return result;
+    }
+}
