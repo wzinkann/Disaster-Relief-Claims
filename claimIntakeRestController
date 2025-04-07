@@ -1,0 +1,76 @@
+package com.disasterrelief.intake.controller;
+
+import java.util.List;
+
+import javax.validation.Valid;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import com.disasterrelief.intake.model.Claim;
+import com.disasterrelief.intake.service.ClaimService;
+import com.disasterrelief.intake.dto.ClaimSubmissionDto;
+import com.disasterrelief.intake.dto.ClaimResponseDto;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import lombok.extern.slf4j.Slf4j;
+
+@RestController
+@RequestMapping("/api/v1/claims")
+@Tag(name = "Claim Intake API", description = "Endpoints for submitting and managing disaster relief claims")
+@Slf4j
+public class ClaimController {
+
+    private final ClaimService claimService;
+    
+    @Autowired
+    public ClaimController(ClaimService claimService) {
+        this.claimService = claimService;
+    }
+    
+    @PostMapping
+    @Operation(summary = "Submit a new claim", description = "Creates a new disaster relief claim with basic information")
+    public ResponseEntity<ClaimResponseDto> submitClaim(@Valid @RequestBody ClaimSubmissionDto claimDto) {
+        log.info("Received new claim submission for disaster: {}", claimDto.getDisasterId());
+        ClaimResponseDto response = claimService.createClaim(claimDto);
+        return new ResponseEntity<>(response, HttpStatus.CREATED);
+    }
+    
+    @PostMapping("/{claimId}/evidence")
+    @Operation(summary = "Add evidence to claim", description = "Upload photos or documents as evidence for a claim")
+    public ResponseEntity<ClaimResponseDto> addEvidenceToClaimId(
+            @PathVariable String claimId,
+            @RequestParam("files") List<MultipartFile> files,
+            @RequestParam(required = false) String description) {
+        
+        log.info("Adding {} evidence items to claim {}", files.size(), claimId);
+        ClaimResponseDto response = claimService.addEvidenceToClaimId(claimId, files, description);
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/{claimId}")
+    @Operation(summary = "Get claim details", description = "Retrieve full details of a specific claim")
+    public ResponseEntity<ClaimResponseDto> getClaimById(@PathVariable String claimId) {
+        log.debug("Fetching claim with ID: {}", claimId);
+        ClaimResponseDto claim = claimService.getClaimById(claimId);
+        return ResponseEntity.ok(claim);
+    }
+    
+    @GetMapping
+    @Operation(summary = "Search claims", description = "Search for claims based on various criteria")
+    public ResponseEntity<List<ClaimResponseDto>> searchClaims(
+            @RequestParam(required = false) String disasterId,
+            @RequestParam(required = false) String claimantEmail,
+            @RequestParam(required = false) String postalCode,
+            @RequestParam(required = false) Claim.ClaimStatus status) {
+        
+        log.debug("Searching claims with filters - disasterId: {}, email: {}, postalCode: {}, status: {}", 
+                  disasterId, claimantEmail, postalCode, status);
+        List<ClaimResponseDto> claims = claimService.searchClaims(disasterId, claimantEmail, postalCode, status);
+        return ResponseEntity.ok(claims);
+    }
+}
