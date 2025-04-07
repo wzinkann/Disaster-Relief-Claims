@@ -1,0 +1,32 @@
+package com.disasterrelief.eligibility.rules;
+
+import lombok.extern.slf4j.Slf4j;
+import org.kie.api.runtime.KieContainer;
+import org.kie.api.runtime.KieSession;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+@Service
+@Slf4j
+public class EligibilityRulesServiceImpl implements EligibilityRulesService {
+
+    private final KieContainer kieContainer;
+    
+    @Autowired
+    public EligibilityRulesServiceImpl(KieContainer kieContainer) {
+        this.kieContainer = kieContainer;
+    }
+    
+    @Override
+    public void executeRules(ClaimFacts facts) {
+        KieSession kieSession = kieContainer.newKieSession();
+        try {
+            kieSession.insert(facts);
+            log.info("Executing eligibility rules for claim {}", facts.getClaimId());
+            int firedRules = kieSession.fireAllRules();
+            log.info("Fired {} rules for claim {}", firedRules, facts.getClaimId());
+        } finally {
+            kieSession.dispose();
+        }
+    }
+}
