@@ -1,0 +1,174 @@
+package com.disasterrelief.assessment.service;
+
+import com.disasterrelief.assessment.client.ClaimIntakeClient;
+import com.disasterrelief.assessment.dto.AssessmentRequestDto;
+import com.disasterrelief.assessment.dto.AssessmentResultDto;
+import com.disasterrelief.assessment.dto.ClaimDetailsDto;
+import com.disasterrelief.assessment.dto.DamageClassification;
+import com.disasterrelief.assessment.events.AssessmentCompletedEvent;
+import com.disasterrelief.assessment.events.AssessmentEventChannels;
+import com.disasterrelief.assessment.model.Assessment;
+import com.disasterrelief.assessment.repository.AssessmentRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.Optional;
+import java.util.UUID;
+
+@Service
+@Slf4j
+public class DamageAssessmentServiceImpl implements DamageAssessmentService {
+
+    private final AssessmentRepository assessmentRepository;
+    private final ClaimIntakeClient claimIntakeClient;
+    private final AssessmentEventChannels eventChannels;
+    private final ImageAnalysisService imageAnalysisService;
+
+    @Autowired
+    public DamageAssessmentServiceImpl(
+            AssessmentRepository assessmentRepository,
+            ClaimIntakeClient claimIntakeClient,
+            AssessmentEventChannels eventChannels,
+            ImageAnalysisService imageAnalysisService) {
+        this.assessmentRepository = assessmentRepository;
+        this.claimIntakeClient = claimIntakeClient;
+        this.eventChannels = eventChannels;
+        this.imageAnalysisService = imageAnalysisService;
+    }
+
+    @Override
+    @Transactional
+    public AssessmentResultDto initiateAssessment(AssessmentRequestDto requestDto) {
+        log.info("Initiating assessment for claim: {}", requestDto.getClaimId());
+        
+        // Fetch claim details from Intake Service
+        ClaimDetailsDto claimDetails = claimIntakeClient.getClaimDetails(requestDto.getClaimId());
+        
+        // Create assessment record
+        Assessment assessment = new Assessment();
+        assessment.setId(UUID.randomUUID().toString());
+        assessment.setClaimId(requestDto.getClaimId());
+        assessment.setStatus(Assessment.Status.PENDING);
+        assessment.setRequestedAt(LocalDateTime.now());
+        assessment.setAssessmentType(requestDto.getAssessmentType());
+        assessment.setClaimantName(claimDetails.getClaimantName());
+        assessment.setPropertyAddress(claimDetails.getPropertyAddress());
+        assessment.setDisasterId(claimDetails.getDisasterId());
+        
+        Assessment savedAssessment = assessmentRepository.save(assessment);
+        
+        // If this is an auto-assessment, process it immediately
+        if (requestDto.getAssessmentType() == Assessment.AssessmentType.AUTOMATED) {
+            return processAutomatedAssessment(savedAssessment.getId(), claimDetails);
+        } else {
+            // For on-site assessments, we'll need to schedule an inspector
+            scheduleSiteAssessment(savedAssessment, requestDto);
+            
+            AssessmentResultDto result = new AssessmentResultDto();
+            result.setAssessmentId(savedAssessment.getId());
+            result.setClaimId(requestDto.getClaimId());
+            result.setStatus(Assessment.Status.SCHEDULED);
+            result.setMessage("Assessment has been scheduled. An inspector will contact you.");
+            return result;
+        }
+    }
+    
+    @Override
+    @Transactional
+    public AssessmentResultDto processAutomatedAssessment(String assessmentId, ClaimDetailsDto claimDetails) {
+        log.info("Processing automated assessment for assessment ID: {}", assessmentId);
+        
+        Assessment assessment = assessmentRepository.findById(assessmentId)
+                .orElseThrow(() -> new IllegalArgumentException("Assessment not found: " + assessmentId));
+        
+        assessment.setStatus(Assessment.Status.IN_PROGRESS);
+        assessmentRepository.save(assessment);
+        
+        try {
+            // Analyze the evidence images using AI
+            DamageClassification classification = 
+                    imageAnalysisService.analyzeDamageImages(claimDetails.getEvidenceUrls());
+            
+            // Update assessment with results
+            assessment.setStatus(Assessment.Status.COMPLETED);
+            assessment.setDamageSeverity(classification.getSeverity());
+            assessment.setDamageType(classification.getType());
+            assessment.setAssessmentNotes(classification.getAnalysisDescription());
+            assessment.setCompletedAt(LocalDateTime.now());
+            assessmentRepository.save(assessment);
+            
+            // Publish assessment completed event
+            publishAssessmentCompleted(assessment);
+            
+            AssessmentResultDto result = new AssessmentResultDto();
+            result.setAssessmentId(assessment.getId());
+            result.setClaimId(assessment.getClaimId());
+            result.setStatus(Assessment.Status.COMPLETED);
+            result.setDamageSeverity(classification.getSeverity());
+            result.setDamageType(classification.getType());
+            result.setEstimatedAmount(classification.getEstimatedAmount());
+            result.setMessage("Automated assessment completed successfully.");
+            
+            return result;
+            
+        } catch (Exception e) {
+            log.error("Error during automated assessment: {}", e.getMessage());
+            assessment.setStatus(Assessment.Status.FAILED);
+            assessment.setAssessmentNotes("Failed due to: " + e.getMessage());
+            assessmentRepository.save(assessment);
+            
+            AssessmentResultDto result = new AssessmentResultDto();
+            result.setAssessmentId(assessment.getId());
+            result.setClaimId(assessment.getClaimId());
+            result.setStatus(Assessment.Status.FAILED);
+            result.setMessage("Automated assessment failed. Manual assessment is required.");
+            return result;
+        }
+    }
+    
+    private void scheduleSiteAssessment(Assessment assessment, AssessmentRequestDto requestDto) {
+        // In a real implementation, this would interact with a scheduling system
+        // to assign an inspector based on location, availability, etc.
+        assessment.setStatus(Assessment.Status.SCHEDULED);
+        assessment.setScheduledDate(requestDto.getPreferredDate());
+        assessment.setAssessmentNotes("Pending inspector assignment");
+        assessmentRepository.save(assessment);
+        
+        log.info("Scheduled on-site assessment for claim {} on {}", 
+                assessment.getClaimId(), requestDto.getPreferredDate());
+    }
+    
+    private void publishAssessmentCompleted(Assessment assessment) {
+        AssessmentCompletedEvent event = new AssessmentCompletedEvent();
+        event.setAssessmentId(assessment.getId());
+        event.setClaimId(assessment.getClaimId());
+        event.setCompletedAt(assessment.getCompletedAt());
+        event.setDamageSeverity(assessment.getDamageSeverity());
+        event.setDamageType(assessment.getDamageType());
+        event.setEstimatedAmount(calculateEstimatedAmount(assessment));
+        
+        eventChannels.assessmentCompletedOutput().send(MessageBuilder.withPayload(event).build());
+        log.info("Published assessment completed event for claim {}", assessment.getClaimId());
+    }
+    
+    private double calculateEstimatedAmount(Assessment assessment) {
+        // In a real implementation, this would use a more sophisticated algorithm
+        // based on damage type, severity, location, and disaster type
+        switch (assessment.getDamageSeverity()) {
+            case MINOR:
+                return 5000.0;
+            case MODERATE:
+                return 25000.0;
+            case MAJOR:
+                return 50000.0;
+            case DESTROYED:
+                return 100000.0;
+            default:
+                return 0.0;
+        }
+    }
+}
